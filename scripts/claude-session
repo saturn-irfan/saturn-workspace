@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORKSPACE="$(cd "$(dirname "$0")/.." && pwd)"
+SESSIONS_DIR="$WORKSPACE/sessions"
+CODE_DIR="$WORKSPACE/code"
+
+usage() {
+    echo "Usage: claude-session <command> [args]"
+    echo ""
+    echo "Commands:"
+    echo "  create <name>   Create a new session (copies code/ into sessions/<name>/code/)"
+    echo "  list            List all sessions with status"
+    echo "  info <name>     Show session details"
+    echo "  done <name>     Delete a completed session"
+    echo ""
+    echo "Examples:"
+    echo "  claude-session create fix-date-bug"
+    echo "  claude-session list"
+    echo "  claude-session done fix-date-bug"
+    exit 1
+}
+
+cmd_create() {
+    local name="$1"
+    local session_dir="$SESSIONS_DIR/$name"
+
+    if [ -d "$session_dir" ]; then
+        echo "Error: Session '$name' already exists at $session_dir"
+        exit 1
+    fi
+
+    echo "Creating session '$name'..."
+    mkdir -p "$session_dir"
+
+    echo "  Copying code/ → sessions/$name/code/ ..."
+    cp -R "$CODE_DIR" "$session_dir/code"
+
+    # Gather branch info from the copied repos
+    local branches=""
+    for repo in "$session_dir/code"/*/; do
+        [ -d "$repo/.git" ] || continue
+        local repo_name
+        repo_name=$(basename "$repo")
+        local branch
+        branch=$(git -C "$repo" branch --show-current 2>/dev/null || echo "detached")
+        branches="$branches- $repo_name: \`$branch\`\n"
+    done
+
+    # Create session.md
+    cat > "$session_dir/session.md" << EOF
+# $name
+
+**Status:** in-progress
+**Created:** $(date '+%Y-%m-%d %H:%M')
+
+## Branches
+$(echo -e "$branches")
+## Task
+_Describe what this session is for_
+
+## Log
+- [$(date '+%H:%M')] Session created
+EOF
+
+    echo ""
+    echo "Session created: $session_dir"
+    echo "  code:    $session_dir/code/"
+    echo "  meta:    $session_dir/session.md"
+    echo ""
+    echo "Run services: make start SESSION=$name"
+}
+
+cmd_list() {
+    if [ ! -d "$SESSIONS_DIR" ] || [ -z "$(ls -A "$SESSIONS_DIR" 2>/dev/null)" ]; then
+        echo "No sessions found."
+        exit 0
+    fi
+
+    printf "%-25s %-15s %-12s %s\n" "SESSION" "STATUS" "CREATED" "BRANCHES"
+    printf "%-25s %-15s %-12s %s\n" "-------" "------" "-------" "--------"
+
+    for session_dir in "$SESSIONS_DIR"/*/; do
+        [ -d "$session_dir" ] || continue
+        local name
+        name=$(basename "$session_dir")
+        local status="unknown"
+        local created="unknown"
+        local branches=""
+
+        if [ -f "$session_dir/session.md" ]; then
+            status=$(grep '^\*\*Status:\*\*' "$session_dir/session.md" | sed 's/\*\*Status:\*\* //' || echo "unknown")
+            created=$(grep '^\*\*Created:\*\*' "$session_dir/session.md" | sed 's/\*\*Created:\*\* //' || echo "unknown")
+        fi
+
+        # Get branches from live repos
+        for repo in "$session_dir/code"/*/; do
+            [ -d "$repo/.git" ] || continue
+            local repo_name
+            repo_name=$(basename "$repo")
+            local branch
+            branch=$(git -C "$repo" branch --show-current 2>/dev/null || echo "?")
+            if [ "$branch" != "stage" ] && [ "$branch" != "main" ]; then
+                branches="$branches $repo_name:$branch"
+            fi
+        done
+
+        printf "%-25s %-15s %-12s %s\n" "$name" "$status" "$created" "$branches"
+    done
+}
+
+cmd_info() {
+    local name="$1"
+    local session_dir="$SESSIONS_DIR/$name"
+
+    if [ ! -d "$session_dir" ]; then
+        echo "Error: Session '$name' not found."
+        exit 1
+    fi
+
+    if [ -f "$session_dir/session.md" ]; then
+        cat "$session_dir/session.md"
+    else
+        echo "No session.md found for '$name'"
+    fi
+
+    echo ""
+    echo "--- Repo Status ---"
+    for repo in "$session_dir/code"/*/; do
+        [ -d "$repo/.git" ] || continue
+        local repo_name
+        repo_name=$(basename "$repo")
+        local branch
+        branch=$(git -C "$repo" branch --show-current 2>/dev/null || echo "detached")
+        local dirty=""
+        if [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then
+            dirty=" (dirty)"
+        fi
+        echo "  $repo_name: $branch$dirty"
+    done
+}
+
+cmd_done() {
+    local name="$1"
+    local session_dir="$SESSIONS_DIR/$name"
+
+    if [ ! -d "$session_dir" ]; then
+        echo "Error: Session '$name' not found."
+        exit 1
+    fi
+
+    echo "Deleting session '$name'..."
+    rm -rf "$session_dir"
+    echo "Session '$name' deleted."
+}
+
+# --- Main ---
+
+[ $# -lt 1 ] && usage
+
+case "$1" in
+    create)
+        [ $# -lt 2 ] && { echo "Error: Session name required."; usage; }
+        cmd_create "$2"
+        ;;
+    list)
+        cmd_list
+        ;;
+    info)
+        [ $# -lt 2 ] && { echo "Error: Session name required."; usage; }
+        cmd_info "$2"
+        ;;
+    done)
+        [ $# -lt 2 ] && { echo "Error: Session name required."; usage; }
+        cmd_done "$2"
+        ;;
+    *)
+        echo "Unknown command: $1"
+        usage
+        ;;
+esac

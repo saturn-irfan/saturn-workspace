@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Reads config.yaml from a session and pulls the configured branch for each service.
+# Usage: sync-session <session-name>
+
+WORKSPACE="$(cd "$(dirname "$0")/.." && pwd)"
+SESSION_NAME="${1:?Usage: sync-session <session-name>}"
+SESSION_DIR="$WORKSPACE/sessions/$SESSION_NAME"
+CONFIG_FILE="$SESSION_DIR/config.yaml"
+SESSION_CODE="$SESSION_DIR/code"
+
+if [ ! -d "$SESSION_DIR" ]; then
+    echo "Session '$SESSION_NAME' not found at $SESSION_DIR"
+    exit 1
+fi
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "No config.yaml found in session '$SESSION_NAME'"
+    exit 1
+fi
+
+echo "Syncing session: $SESSION_NAME"
+echo ""
+
+# Parse config.yaml — each line is "service: branch"
+while IFS= read -r line; do
+    # Skip comments and empty lines
+    [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+
+    svc="${line%%:*}"
+    branch="${line#*: }"
+    svc="$(echo "$svc" | xargs)"
+    branch="$(echo "$branch" | xargs)"
+
+    repo="$SESSION_CODE/$svc"
+    if [ ! -d "$repo/.git" ]; then
+        echo "  [✗] $svc — not a git repo, skipping"
+        continue
+    fi
+
+    current_branch=$(cd "$repo" && git branch --show-current)
+    before_hash=$(cd "$repo" && git rev-parse HEAD)
+
+    if [ "$current_branch" = "$branch" ]; then
+        # Same branch — just pull
+        if (cd "$repo" && git pull origin "$branch" --quiet 2>&1); then
+            after_hash=$(cd "$repo" && git rev-parse HEAD)
+            new_commits=$(cd "$repo" && git rev-list "$before_hash".."$after_hash" --count)
+            if [ "$new_commits" -eq 0 ]; then
+                echo "  [✓] $svc ($branch) — up to date"
+            else
+                echo "  [✓] $svc ($branch) — pulled +$new_commits commit(s)"
+            fi
+        else
+            echo "  [✗] $svc ($branch) — pull failed"
+        fi
+    else
+        # Different branch — fetch, checkout, pull
+        if (cd "$repo" && git fetch origin "$branch" --quiet 2>&1 && \
+            git checkout "$branch" --quiet 2>&1 && \
+            git pull origin "$branch" --quiet 2>&1); then
+            after_hash=$(cd "$repo" && git rev-parse HEAD)
+            new_commits=$(cd "$repo" && git rev-list "$before_hash".."$after_hash" --count)
+            if [ "$new_commits" -eq 0 ]; then
+                echo "  [✓] $svc ($current_branch → $branch) — switched and pulled, up to date"
+            else
+                echo "  [✓] $svc ($current_branch → $branch) — switched and pulled +$new_commits commit(s)"
+            fi
+        else
+            echo "  [✗] $svc ($current_branch → $branch) — failed"
+        fi
+    fi
+done < "$CONFIG_FILE"
+
+echo ""
+echo "Sync complete."

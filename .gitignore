@@ -1,0 +1,15 @@
+# Service repos — each is its own git repo, cloned by setup.sh
+code/
+
+# Env files — contain secrets, never commit
+envs/*.env
+
+# Runtime artifacts
+.logs/
+sessions/
+
+# Personal todos
+todos/
+
+# macOS
+.DS_Store

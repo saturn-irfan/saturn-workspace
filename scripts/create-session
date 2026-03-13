@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORKSPACE="$(cd "$(dirname "$0")/.." && pwd)"
+SESSIONS_DIR="$WORKSPACE/sessions"
+SERVICES=(mars shuttle chat jupiter saturn-backend saturn-fe abe area51)
+
+REMOTES=(
+    "mars|https://github.com/Saturn-Fintech/mars.git"
+    "shuttle|https://github.com/Saturn-Fintech/shuttle.git"
+    "chat|https://github.com/Saturn-Fintech/chat.git"
+    "jupiter|https://github.com/Saturn-Fintech/jupiter.git"
+    "saturn-backend|https://github.com/Saturn-Fintech/saturn-backend.git"
+    "saturn-fe|https://github.com/Saturn-Fintech/saturn-fe.git"
+    "abe|https://github.com/Saturn-Fintech/abe.git"
+    "area51|https://github.com/Saturn-Fintech/area51.git"
+)
+
+get_remote() {
+    local svc="$1"
+    for entry in "${REMOTES[@]}"; do
+        local name="${entry%%|*}"
+        local url="${entry#*|}"
+        if [ "$name" = "$svc" ]; then
+            echo "$url"
+            return
+        fi
+    done
+}
+
+# ============================================================================
+# USAGE
+# ============================================================================
+
+usage() {
+    echo "Usage: $0 <session-name> [options]"
+    echo ""
+    echo "Options:"
+    echo "  --claude-id <id>       Claude session ID for tracking"
+    echo "  --description <text>   Short description of what this session is for"
+    echo "  --todo <link>          Link to the todo task this session is working on"
+    echo ""
+    echo "Examples:"
+    echo "  $0 co-planner --claude-id abc123 --description 'Fix co-planner chat bugs'"
+    echo "  $0 name-bug --todo 'Adam Rawling name bug' --claude-id def456"
+    exit 1
+}
+
+# ============================================================================
+# PARSE ARGS
+# ============================================================================
+
+SESSION_NAME=""
+CLAUDE_ID=""
+DESCRIPTION=""
+TODO_LINK=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --claude-id)   CLAUDE_ID="$2"; shift 2 ;;
+        --description) DESCRIPTION="$2"; shift 2 ;;
+        --todo)        TODO_LINK="$2"; shift 2 ;;
+        --help|-h)     usage ;;
+        -*)            echo "Unknown option: $1"; usage ;;
+        *)
+            if [ -z "$SESSION_NAME" ]; then
+                SESSION_NAME="$1"; shift
+            else
+                echo "Unexpected argument: $1"; usage
+            fi
+            ;;
+    esac
+done
+
+SESSION_NAME="${SESSION_NAME:-$(date +%Y%m%d-%H%M%S)}"
+SESSION_DIR="$SESSIONS_DIR/$SESSION_NAME"
+
+if [ -d "$SESSION_DIR" ]; then
+    echo "Session '$SESSION_NAME' already exists at $SESSION_DIR"
+    exit 1
+fi
+
+mkdir -p "$SESSION_DIR"
+
+echo "Creating session: $SESSION_NAME"
+echo ""
+
+# ============================================================================
+# METADATA
+# ============================================================================
+
+# .session — Claude session ID for tracking
+if [ -n "$CLAUDE_ID" ]; then
+    echo "$CLAUDE_ID" > "$SESSION_DIR/.session"
+fi
+
+# .info — session metadata
+cat > "$SESSION_DIR/.info" <<EOF
+name: $SESSION_NAME
+created: $(date '+%Y-%m-%d %H:%M:%S')
+description: ${DESCRIPTION:-}
+todo: ${TODO_LINK:-}
+status: created
+branches:
+EOF
+
+# Record which branch each service was cloned from
+for svc in "${SERVICES[@]}"; do
+    branch=$(cd "$WORKSPACE/code/$svc" && git branch --show-current)
+    echo "  $svc: $branch" >> "$SESSION_DIR/.info"
+done
+
+# Generate config.yaml — editable branch config for the session
+CONFIG_FILE="$SESSION_DIR/config.yaml"
+echo "# Branch config for session: $SESSION_NAME" > "$CONFIG_FILE"
+echo "# Edit branches below, then run: make pull session=$SESSION_NAME" >> "$CONFIG_FILE"
+echo "" >> "$CONFIG_FILE"
+for svc in "${SERVICES[@]}"; do
+    branch=$(cd "$WORKSPACE/code/$svc" && git branch --show-current)
+    echo "$svc: $branch" >> "$CONFIG_FILE"
+done
+
+echo "---" >> "$SESSION_DIR/.info"
+echo "log:" >> "$SESSION_DIR/.info"
+echo "  - $(date '+%Y-%m-%d %H:%M') | created session" >> "$SESSION_DIR/.info"
+
+# ============================================================================
+# CLONE
+# ============================================================================
+
+# Clone all repos in parallel (local shallow clone from code/)
+SESSION_CODE="$SESSION_DIR/code"
+mkdir -p "$SESSION_CODE"
+
+PIDS=()
+SVC_NAMES=()
+
+for svc in "${SERVICES[@]}"; do
+    branch=$(cd "$WORKSPACE/code/$svc" && git branch --show-current)
+    (
+        git clone --branch "$branch" \
+            "file://$WORKSPACE/code/$svc" \
+            "$SESSION_CODE/$svc" --quiet
+
+        cd "$SESSION_CODE/$svc"
+        git remote set-url origin "$(get_remote "$svc")"
+
+        echo "  [+] $svc ($branch)"
+    ) &
+    PIDS+=($!)
+    SVC_NAMES+=("$svc")
+done
+
+# Wait for each clone and track failures
+FAILED=()
+for i in "${!PIDS[@]}"; do
+    if ! wait "${PIDS[$i]}"; then
+        FAILED+=("${SVC_NAMES[$i]}")
+        echo "  [✗] ${SVC_NAMES[$i]} clone failed"
+    fi
+done
+
+# Validate each clone has a .git directory
+for svc in "${SERVICES[@]}"; do
+    if [ ! -d "$SESSION_CODE/$svc/.git" ]; then
+        # Don't double-report if already in FAILED
+        [[ " ${FAILED[*]:-} " == *" $svc "* ]] || FAILED+=("$svc")
+        echo "  [✗] $svc missing .git — invalid clone"
+        rm -rf "$SESSION_CODE/$svc"
+    fi
+done
+
+if [ ${#FAILED[@]} -gt 0 ]; then
+    echo ""
+    echo "ERROR: Failed to clone: ${FAILED[*]}"
+    echo "Cleaning up session..."
+    rm -rf "$SESSION_DIR"
+    exit 1
+fi
+
+echo ""
+echo "Installing dependencies..."
+echo ""
+
+# Install deps / build binaries (parallel — no cross-service dependencies)
+export CODE_ROOT="$SESSION_CODE"
+INSTALL_PIDS=()
+INSTALL_SVCS=()
+
+for svc in "${SERVICES[@]}"; do
+    (
+        "$WORKSPACE/scripts/$svc.sh" install 2>&1
+    ) &
+    INSTALL_PIDS+=($!)
+    INSTALL_SVCS+=("$svc")
+done
+
+INSTALL_FAILED=()
+for i in "${!INSTALL_PIDS[@]}"; do
+    if ! wait "${INSTALL_PIDS[$i]}"; then
+        INSTALL_FAILED+=("${INSTALL_SVCS[$i]}")
+        echo "  [✗] ${INSTALL_SVCS[$i]} install failed"
+    fi
+done
+
+if [ ${#INSTALL_FAILED[@]} -gt 0 ]; then
+    echo ""
+    echo "WARNING: Install failed for: ${INSTALL_FAILED[*]}"
+    echo "Session created but some services may not work."
+fi
+
+# Update status
+sed -i '' 's/^status: created/status: ready/' "$SESSION_DIR/.info"
+echo "  - $(date '+%Y-%m-%d %H:%M') | deps installed, session ready" >> "$SESSION_DIR/.info"
+
+echo ""
+echo "Session ready: $SESSION_NAME"
+echo "  make start session=$SESSION_NAME"

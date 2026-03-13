@@ -1,0 +1,1 @@
+In this repository the agents.md files is ./claude.md file 
